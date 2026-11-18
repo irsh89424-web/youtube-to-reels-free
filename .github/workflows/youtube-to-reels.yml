@@ -1,0 +1,65 @@
+name: YouTube to Reels (Free)
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "YouTube URL you own or are authorized to repurpose"
+        required: true
+        type: string
+      max_clips:
+        description: "Maximum clips (1-5 recommended)"
+        required: true
+        default: "3"
+        type: string
+      model_size:
+        description: "Whisper model size"
+        required: true
+        default: "base"
+        type: choice
+        options: [tiny, base, small]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youtube-to-reels-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  create-reels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - name: Install free processing dependencies
+        run: pip install -r requirements.txt
+      - name: Create Reels
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+          MAX_CLIPS: ${{ inputs.max_clips }}
+          MODEL_SIZE: ${{ inputs.model_size }}
+        run: |
+          python scripts/reels.py \
+            --url "$VIDEO_URL" \
+            --max-clips "$MAX_CLIPS" \
+            --min-seconds 30 \
+            --max-seconds 60 \
+            --model-size "$MODEL_SIZE" \
+            --output-dir output
+      - name: Upload finished clips
+        if: always() && hashFiles('output/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: reels-clips-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7
