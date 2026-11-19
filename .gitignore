@@ -7,3 +7,10 @@ output/
 downloads/
 *.mp4
 *.mp3
+
+# Local Whisper engine and test files
+whisper.cpp/
+scripts/reels.py.backup
+test-audio.wav
+test-result.json
+test-full.json

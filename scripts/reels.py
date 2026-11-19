@@ -11,8 +11,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import yt_dlp
-from faster_whisper import WhisperModel
 
 HOOK_TERMS = {
     "secret", "mistake", "never", "always", "best", "worst", "truth", "actually",
@@ -31,6 +29,7 @@ def require_tools() -> None:
         raise SystemExit("Missing system tools: " + ", ".join(missing))
 
 def download_video(url: str, work: Path) -> tuple[Path, dict[str, Any]]:
+    import yt_dlp
     opts = {
         "format": "bv*+ba/b", "merge_output_format": "mp4",
         "outtmpl": str(work / "source.%(ext)s"), "noplaylist": True,
@@ -58,6 +57,7 @@ def extract_audio(video: Path, work: Path) -> Path:
     return audio
 
 def transcribe(audio: Path, model_size: str, language: str | None):
+    from faster_whisper import WhisperModel
     print(f"Loading faster-whisper {model_size!r} model on CPU (INT8)...")
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
     segments, info = model.transcribe(
@@ -74,6 +74,66 @@ def transcribe(audio: Path, model_size: str, language: str | None):
                 words.append({"word": token, "start": float(w.start), "end": float(w.end)})
     print("Detected language:", getattr(info, "language", "unknown"))
     return words, "\n".join(lines)
+
+
+def transcribe_whisper_cpp(
+    audio: Path,
+    cli: Path,
+    model: Path,
+    language: str | None,
+    work: Path,
+    duration: float,
+):
+    if not cli.is_file():
+        raise FileNotFoundError(f"Whisper.cpp CLI not found: {cli}")
+    if not model.is_file():
+        raise FileNotFoundError(f"Whisper model not found: {model}")
+
+    json_prefix = work / "whisper-result"
+    cmd = [
+        str(cli), "-m", str(model), "-f", str(audio),
+        "-ojf", "-of", str(json_prefix), "-np", "-ng",
+    ]
+    if language:
+        cmd += ["-l", language]
+
+    run(cmd)
+    data = json.loads(Path(str(json_prefix) + ".json").read_text(encoding="utf-8"))
+
+    words = []
+    transcript = []
+
+    for segment in data.get("transcription", []):
+        text = segment.get("text", "").strip()
+        if text:
+            offsets = segment.get("offsets", {})
+            start = offsets.get("from", 0) / 1000
+            end = offsets.get("to", 0) / 1000
+            transcript.append(f"[{start:.2f}-{end:.2f}] {text}")
+
+        for token in segment.get("tokens", []):
+            word = token.get("text", "")
+            if not word or word.startswith("[_"):
+                continue
+
+            offsets = token.get("offsets", {})
+            start = offsets.get("from", 0) / 1000
+            end = offsets.get("to", 0) / 1000
+
+            if end <= start:
+                end = min(duration, start + 0.12)
+
+            if end > start:
+                words.append({
+                    "word": word,
+                    "start": start,
+                    "end": end,
+                })
+
+    if not words:
+        raise RuntimeError("Whisper.cpp returned no usable word timestamps.")
+
+    return words, "\\n".join(transcript)
 
 def score_window(words: list[dict[str, Any]]) -> float:
     tokens = [re.sub(r"^[^\w']+|[^\w']+$", "", w["word"].lower()) for w in words]
@@ -175,38 +235,88 @@ def render_clip(video, words, clip, index, output):
             "reason": clip["reason"]}
 
 def main():
+    project = Path(__file__).resolve().parent.parent
+    default_cli = project / "whisper.cpp/build/bin/whisper-cli"
+    default_model = project / "whisper.cpp/models/ggml-tiny.en.bin"
+
     p = argparse.ArgumentParser()
-    p.add_argument("--url", required=True)
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--url")
+    source.add_argument("--file")
     p.add_argument("--max-clips", type=int, default=3)
     p.add_argument("--min-seconds", type=int, default=30)
     p.add_argument("--max-seconds", type=int, default=60)
     p.add_argument("--model-size", choices=["tiny", "base", "small"], default="base")
-    p.add_argument("--language", default=None, help="Optional code such as en, ml, ar; default auto-detect.")
+    p.add_argument("--language", default=None, help="Optional language code, such as en.")
+    p.add_argument("--whisper-cli", default=str(default_cli))
+    p.add_argument("--whisper-model", default=str(default_model))
     p.add_argument("--output-dir", default="output")
     a = p.parse_args()
-    if not 1 <= a.max_clips <= 5: raise SystemExit("--max-clips must be 1–5.")
-    if not 10 <= a.min_seconds <= a.max_seconds <= 90: raise SystemExit("Invalid clip duration range.")
+
+    if not 1 <= a.max_clips <= 5:
+        raise SystemExit("--max-clips must be 1–5.")
+    if not 10 <= a.min_seconds <= a.max_seconds <= 90:
+        raise SystemExit("Invalid clip duration range.")
+
     require_tools()
-    output = Path(a.output_dir); output.mkdir(parents=True, exist_ok=True)
+    output = Path(a.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
     with tempfile.TemporaryDirectory(prefix="youtube-reels-") as tmp:
         work = Path(tmp)
-        print("Downloading source. Only use content you own or are authorized to repurpose.")
-        video, info = download_video(a.url, work)
+
+        if a.file:
+            video = Path(a.file).expanduser().resolve()
+            if not video.is_file():
+                raise FileNotFoundError(f"Video file not found: {video}")
+            title = video.stem
+            print("Processing selected local video.")
+        else:
+            print("Downloading source. Only use content you own or are authorized to repurpose.")
+            video, info = download_video(a.url, work)
+            title = info.get("title", video.name)
+
         duration = get_duration(video)
-        print(f"Source: {info.get('title', video.name)} ({duration/60:.1f} min)")
+        print(f"Source: {title} ({duration/60:.1f} min)")
         audio = extract_audio(video, work)
-        words, transcript = transcribe(audio, a.model_size, a.language)
-        if not words: raise RuntimeError("No speech transcript found.")
-        clips = choose_highlights(words, duration, a.min_seconds, a.max_seconds, a.max_clips)
-        if not clips: raise RuntimeError("No suitable speech windows found; try a longer video.")
+
+        if a.file:
+            words, transcript = transcribe_whisper_cpp(
+                audio,
+                Path(a.whisper_cli).expanduser().resolve(),
+                Path(a.whisper_model).expanduser().resolve(),
+                a.language,
+                work,
+                duration,
+            )
+        else:
+            words, transcript = transcribe(audio, a.model_size, a.language)
+
+        if not words:
+            raise RuntimeError("No speech transcript found.")
+
+        clips = choose_highlights(
+            words, duration, a.min_seconds, a.max_seconds, a.max_clips
+        )
+        if not clips:
+            raise RuntimeError("No suitable speech windows found; try different clip settings.")
+
         results = []
         for i, clip in enumerate(clips, 1):
             print(f"Rendering clip {i}/{len(clips)}...")
             results.append(render_clip(video, words, clip, i, output))
-        (output / "clips.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
-        (output / "captions-transcript.txt").write_text(transcript, encoding="utf-8")
-        for ass in output.glob("*.ass"): ass.unlink(missing_ok=True)
+
+        (output / "clips.json").write_text(
+            json.dumps(results, indent=2), encoding="utf-8"
+        )
+        (output / "captions-transcript.txt").write_text(
+            transcript, encoding="utf-8"
+        )
+        for ass in output.glob("*.ass"):
+            ass.unlink(missing_ok=True)
+
         print(f"Created {len(results)} clip(s) in {output.resolve()}")
+
 
 if __name__ == "__main__":
     main()
